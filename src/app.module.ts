@@ -5,6 +5,7 @@ import { WahaController } from './waha/waha.controller';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { Message } from './waha/message.entity';
 import { HttpModule } from '@nestjs/axios';
+import { WahaGateway } from './waha/waha.gateway';
 
 @Module({
   imports: [
@@ -22,6 +23,6 @@ import { HttpModule } from '@nestjs/axios';
     TypeOrmModule.forFeature([Message]),
   ],
   controllers: [AppController, WahaController],
-  providers: [AppService],
+  providers: [AppService, WahaGateway],
 })
 export class AppModule {}

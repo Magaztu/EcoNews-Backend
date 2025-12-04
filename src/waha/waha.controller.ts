@@ -4,6 +4,8 @@ import { Message } from './message.entity';
 import { Repository } from 'typeorm';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
+import { Get } from '@nestjs/common';
+import { WahaGateway } from './waha.gateway';
 
 const CHANNEL_ID = "120363405198767554@newsletter"
 
@@ -14,8 +16,18 @@ export class WahaController {
   constructor(
     @InjectRepository(Message)
     private messageRepo: Repository<Message>,
-    private readonly httpService: HttpService
+    private readonly httpService: HttpService,
+    private readonly wahaGateway: WahaGateway
   ) {}
+
+  @Get('posts') // Endpoint para android
+  async getPosts() {
+    // 50 Posts más recientes, en orden desc como db
+    return this.messageRepo.find({
+      order: { createdAt: 'DESC' },
+      take: 50
+    });
+  }
 
   @Post('publish')
   async createPost(@Body() body: { text: string }) {
@@ -41,22 +53,26 @@ export class WahaController {
         })
       );
 
-      const createdMessageId = response.data.id; 
+    //   const createdMessageId = response.data.id; 
+      const rawId = response.data.id; 
+      const finalId = rawId._serialized || rawId;
 
-      this.logger.log(`WAHA accepted. Created ID: ${createdMessageId}`);
+      this.logger.log(`WAHA accepted. Created ID: ${finalId}`);
 
       const newMessage = this.messageRepo.create({
-        whatsappId: createdMessageId,
+        whatsappId: finalId,
         from: CHANNEL_ID,
         fromMe: true,
         body: body.text,
         status: 'sent',
       });
 
-      await this.messageRepo.save(newMessage);
+      const savedMessage = await this.messageRepo.save(newMessage);
       this.logger.log(` Saved to DB directly from Publish endpoint`);
+
+      this.wahaGateway.notifyNewPost(savedMessage);
       
-      return { status: 'success', message: 'Post saved and sent', id: createdMessageId };
+      return { status: 'success', message: 'Post saved and sent', id: finalId };
 
     } catch (error) {
       this.logger.error('Failed to publish', error.response?.data || error.message);
@@ -76,6 +92,10 @@ export class WahaController {
             this.handleNewMessage(payload.payload);
             break;
         
+        case 'message.create':
+            await this.handleNewMessage(payload.payload);
+            break;
+
         case 'message.revoked':
             this.handleMessageRevoked(payload.payload);
             break;
@@ -112,6 +132,12 @@ export class WahaController {
     }
 
     try {
+      const exists = await this.messageRepo.findOne({ where: { whatsappId: realId } });
+      if (exists) {
+        this.logger.debug(`Skipping duplicate message: ${realId}`);
+        return;
+      }
+
       const newMessage = this.messageRepo.create({
         whatsappId: realId,
         from: data.from,
@@ -120,28 +146,54 @@ export class WahaController {
         status: 'published',
       });
 
-      await this.messageRepo.save(newMessage);
+      const savedMessage = await this.messageRepo.save(newMessage);
       
       this.logger.log(` DATABASE SAVED: ${data.body} (ID: ${realId})`);
+
+      this.wahaGateway.notifyNewPost(savedMessage);
       
     } catch (error) {
-      this.logger.error(` DATABASE ERROR: ${error.message}`, error.stack);
+      if (error.code !== '23505') { // ignorar replicas por mis mensajes
+          this.logger.error(`DATABASE ERROR: ${error.message}`);
+      }
     }
   }
 
   private async handleMessageRevoked(data: any) {
-    const idToDelete = data.after?.id || data.id;
+    const rawId = data.after?.id || data.id;
+    const idToDelete = rawId?._serialized || rawId;
 
-    if (idToDelete) {
-      
-      const result = await this.messageRepo.delete({ whatsappId: idToDelete });
-      
-      if (result.affected as number > 0) {
-        this.logger.log(`Deleted message: ${idToDelete}`);
-        // TODO: Emit 'delete' event to WebSocket
-      } else {
-        this.logger.warn(`Could not find message to delete: ${idToDelete}`);
-      }
+    this.logger.log(`Webhook asked to delete: ${idToDelete}`);
+
+    if (!idToDelete) return;
+
+    const result = await this.messageRepo.delete({ whatsappId: idToDelete });
+    
+    if (result.affected as number > 0) {
+      this.logger.log(`Deleted exact match: ${idToDelete}`);
+      this.wahaGateway.server.emit('post_deleted', { id: idToDelete });
+      return;
+    } 
+
+    this.logger.warn(` Exact ID not found. Trying to find the most recent orphan message...`);
+
+    const lastMessage = await this.messageRepo.findOne({
+        where: { 
+            from: CHANNEL_ID, // Solo edl canal
+            fromMe: true      // Solo from me
+        },
+        order: { createdAt: 'DESC' }
+    });
+
+    if (lastMessage) {
+        this.logger.log(` Found a likely match by context: ${lastMessage.body} (ID: ${lastMessage.whatsappId})`);
+        
+        await this.messageRepo.delete({ whatsappId: lastMessage.whatsappId });
+        
+        this.wahaGateway.server.emit('post_deleted', { id: lastMessage.whatsappId });
+        this.logger.log(` Deleted via Fallback!`);
+    } else {
+        this.logger.error(` Could not find any message to delete.`);
     }
   }
 
@@ -154,8 +206,12 @@ export class WahaController {
     if (msgId) {
       await this.messageRepo.update({ whatsappId: msgId }, { status: newStatus });
       this.logger.log(`✅ Status updated to '${newStatus}' for ${msgId}`);
-      // TODO: Emit 'update' event to WebSocket
+      this.wahaGateway.notifyStatusUpdate({ 
+        id: msgId, 
+        status: newStatus 
+      });
     }
+    
   }
   private handleSessionStatus(payload: any) {
     this.logger.log(`Session Status: ${payload.status} | Session: ${payload.session}`);
@@ -166,3 +222,5 @@ export class WahaController {
 // Invoke-RestMethod -Method Post -Uri "http://localhost:3001/api/waha/publish" `
 //   -ContentType "application/json" `
 //   -Body '{"text": "Hello PowerShell!"}'
+
+//docker exec -it whatsapp_db psql -U mathias -d whatsapp_db -c "SELECT * FROM message;"
